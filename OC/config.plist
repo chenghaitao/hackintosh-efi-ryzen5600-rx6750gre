@@ -1646,6 +1646,8 @@
 			<string>Disabled</string>
 			<key>Vault</key>
 			<string>Optional</string>
+			<key>WriteFlash</key>
+			<true/>
 		</dict>
 		<key>Serial</key>
 		<dict>
@@ -1722,6 +1724,7 @@
 				<string>csr-active-config</string>
 				<string>bluetoothExternalDongleFailed</string>
 				<string>bluetoothInternalControllerInfo</string>
+				<string>boot-args</string>
 			</array>
 		</dict>
 		<key>LegacyOverwrite</key>
