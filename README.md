@@ -3,7 +3,8 @@
 一份**已在真机跑通**的 OpenCore EFI 备份。重点在于两件通常要自己动手的事：
 
 1. **AMD RX 6750 GRE（Navi 22, `1002:73DF`）没有原生驱动** —— 这份 EFI 带的是**自行编译**的 [NootRX](https://github.com/ChefKissInc/NootRX)，并修掉了上游手工编译时必然踩的 `kmod_info` 缺失问题；
-2. **Intel AX210 在 macOS 26 上官方 AirportItlwm 已不适用** —— 换成了 Tahoe 专用的社区构建，恢复原生 Wi-Fi 菜单，不再需要 HeliPort。
+2. **Intel AX210 在 macOS 26 上官方 AirportItlwm 已不适用** —— 换成了 Tahoe 专用的社区构建，恢复原生 Wi-Fi 菜单，不再需要 HeliPort；
+3. **macOS 26 删掉了 `AppleHDA.kext`，传统 AppleALC 路线直接失效** —— 用 [SimpleHDA](https://github.com/laobamac/SimpleHDA)（内嵌整个 AppleHDA 栈的 Lilu 插件）+ AppleALC 恢复了 Realtek ALC892 板载声卡。
 
 > ⚠️ 仓库里的 `config.plist` **三码已脱敏**（`SystemSerialNumber` / `MLB` / `SystemUUID` / `ROM` 全是占位符）。直接拿去用之前必须自己生成一套，见 [使用前必做](#使用前必做改三码)。
 
@@ -22,7 +23,7 @@
 | 蓝牙 | AX210 内置（USB 总线） | `IntelBluetoothFirmware` + `IntelBTPatcher` + `BlueToolFixup` |
 | 存储 | 500 GB macOS APFS 卷 / 500 GB NTFS / 2 TB 数据盘 | NVMe + SATA 混装，`NVMeFix` 已启用 |
 | 显示器 | ASUS VG279 | 1920×1080，DP 输出 |
-| 音频 | **仅 DP/HDMI 音频** | 未装 AppleALC → 板载声卡不工作 |
+| 音频 | **Realtek ALC892**（MSI `1462:cb86`） | `SimpleHDA` + `AppleALC`，内建扬声器/麦克风/数码输出全可用 |
 | SMBIOS | **MacPro7,1** | `board-id = Mac-27AD2F918AE68F61` |
 
 ## 软件环境
@@ -42,6 +43,8 @@
 | Kext | 版本 | 作用 | 状态 |
 |---|---|---|---|
 | `Lilu` | 1.7.3 | 补丁框架，其余 kext 的前置 | ✅ |
+| `AppleALC` | 1.9.8 | 板载声卡编解码器补丁 | ✅ |
+| `SimpleHDA` | 1.0.0 | **内嵌 AppleHDA 栈（macOS 26 必需，见下文）** | ✅ |
 | `VirtualSMC` | 1.3.9 | SMC 模拟 | ✅ |
 | `NootRX` | 1.0.0 | **Navi 22 图形加速（自行编译）** | ✅ |
 | `AirportItlwm` | 2.4.0 | **Intel 无线原生 Wi-Fi（Tahoe 构建）** | ✅ |
@@ -104,6 +107,24 @@ curl -s -o /dev/null -w '%{http_code}\n' --interface <en1 的 IP> https://www.ap
 
 > 顺便一个坑：`curl --interface en1`（绑设备名）会瞬间返回 000，必须绑**源 IP** 才正常。
 
+### 4. macOS 26 删了 AppleHDA，板载音频要走 SimpleHDA
+
+Apple 在 macOS 26 Tahoe 里**彻底删除了 `AppleHDA.kext`**，所以传统的「AppleALC + layout-id」路线在 Tahoe 上直接失效（AppleALC 本身还能加载，但没有宿主可打补丁）。HDMI/DP 音频不受影响，走的是显卡的 `AppleGFXHDA` 栈。
+
+本机的解法是 **[SimpleHDA](https://github.com/laobamac/SimpleHDA)**（laobamac 出品的 Lilu 插件，内嵌了完整 AppleHDA 控制器/编解码器栈）+ AppleALC：
+
+- `Kernel > Add` 顺序必须是 **Lilu → AppleALC → SimpleHDA**；
+- `SimpleHDA` 设了 `MinKernel=25.0.0 / MaxKernel=25.99.99`，只在 Tahoe 加载；
+- `DeviceProperties` 给 `PciRoot(0x0)/Pci(0x8,0x1)/Pci(0x0,0x4)`（ALC892 所在 PCI 路径）注入了 `layout-id`——但实测 **SimpleHDA 会用自己的 layout-id（7）覆盖注入值**，所以这个值实际上随便填；
+- 无需 root patch、无需降 SIP。
+
+排查时的一个坑：**别用 `kextstat` 判断成败**。SimpleHDA 把 AppleHDA 栈内嵌在自己的二进制里，`kextstat` 里看不到 `AppleHDAController` / `IOHDAFamily` 的包名，但 IORegistry 里类是活的。真判据是：
+
+```bash
+ioreg -r -n HDEF | grep -E "AppleHDAController|IOHDACodecDevice|AppleHDAEngineOutput"
+# 有输出 = 编解码器已枚举；system_profiler 里出现"内建输出"同理
+```
+
 ---
 
 ## 已知限制（诚实版）
@@ -111,7 +132,6 @@ curl -s -o /dev/null -w '%{http_code}\n' --interface <en1 的 IP> https://www.ap
 | 限制 | 说明 | 能不能修 |
 |---|---|---|
 | **无硬件视频编解码** | `ioreg` 里没有 `AppleGVA`/`VDA` 节点，`kmutil` 里没有 `X6000VCN`。NootRX 只打通图形/计算通路，媒体引擎不参与 | 换 Navi 21/23 原生机型 |
-| **无板载声卡** | 未装 AppleALC，当前只有 DP/HDMI 音频 | 加 `AppleALC` + 对应 `layout-id` 可解 |
 | 睡眠唤醒未验证 | NootRX 常见雷区：唤醒后花屏/掉加速 | 试 `hibernatemode=0`（当前值），出问题用 `-NRXDebug` 抓日志 |
 | 多屏热插拔未验证 | — | — |
 | Alpha 驱动 | AirportItlwm 是社区 alpha 构建，作者本人标注"硬件验证前别日常用" | 出问题回退 `itlwm` + HeliPort |
@@ -183,6 +203,7 @@ EFI/
 | [OpenCore](https://github.com/acidanthera/OpenCorePkg)、[Lilu](https://github.com/acidanthera/Lilu)、[VirtualSMC](https://github.com/acidanthera/VirtualSMC)、[RestrictEvents](https://github.com/acidanthera/RestrictEvents)、[NVMeFix](https://github.com/acidanthera/NVMeFix)、[BlueToolFixup](https://github.com/acidanthera/BrcmPatchRAM) | Acidanthera | 引导与基础 kext |
 | [NootRX](https://github.com/ChefKissInc/NootRX) | ChefKissInc | Navi 22 图形加速（本仓库为自行构建版） |
 | [itlwm](https://github.com/OpenIntelWireless/itlwm) / [laobamac 的 Tahoe 分支](https://github.com/laobamac/itlwm) | OpenIntelWireless、laobamac | Intel 无线 |
+| [SimpleHDA](https://github.com/laobamac/SimpleHDA) | laobamac | macOS 26 板载音频（内嵌 AppleHDA 栈） |
 | [RealtekRTL8111](https://github.com/Mieze/RTL8111_driver_for_OS_X) | Mieze | 有线网卡 |
 | [USBToolBox](https://github.com/USBToolBox/kext) | dhinakg 等 | USB 端口映射 |
 
